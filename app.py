@@ -26,7 +26,9 @@ from whale_trades import (
     classify_large_trades,
     calculate_flow_adjusted_levels,
     calculate_flow_pressure,
+    analyze_large_trade_price_impact,
     format_duration,
+    find_new_quantity_alerts,
     fetch_taker_volume_summaries,
     load_aggregate_trades,
     predict_next_large_buy,
@@ -126,7 +128,16 @@ large_trade_lookback = st.sidebar.selectbox(
     "Ventana del flujo", options=[1, 6, 24, 72], index=2,
     format_func=lambda hours: f"Últimas {hours} horas",
 )
-auto_refresh_whales = st.sidebar.toggle("Actualizar flujo cada 5 segundos", value=True)
+auto_refresh_whales = st.sidebar.toggle("Actualizar flujo cada 2 segundos", value=True)
+btc_quantity_alert_threshold = st.sidebar.selectbox(
+    "Alertar operaciones desde",
+    options=[5.0, 10.0],
+    index=0,
+    format_func=lambda quantity: f"{quantity:.0f} BTC",
+)
+enable_btc_quantity_alerts = st.sidebar.toggle(
+    "Activar alertas visuales ≥ BTC", value=True
+)
 
 st.sidebar.markdown("---")
 run_btn = st.sidebar.button("🚀 Ejecutar Simulación", use_container_width=True)
@@ -174,7 +185,7 @@ except Exception as e:
 st.markdown("<br>", unsafe_allow_html=True)
 
 
-@st.fragment(run_every=5)
+@st.fragment(run_every=2)
 def render_large_trades_monitor():
     """Monitor aislado: su refresco no vuelve a entrenar el modelo."""
     st.markdown("### 🐋 Compras y ventas grandes en Binance Spot")
@@ -203,6 +214,57 @@ def render_large_trades_monitor():
             st.info("Aún no hay operaciones almacenadas. Pulsa 'Actualizar ahora' para iniciar la captura.")
             return
 
+        now = pd.Timestamp.now(tz="UTC")
+        alert_state_key = (
+            f"quantity_alert_last_id_{symbol}_{btc_quantity_alert_threshold:g}"
+        )
+        last_seen_id = st.session_state.get(alert_state_key)
+        if last_seen_id is None:
+            # Al activar el monitor no se disparan alertas históricas.
+            st.session_state[alert_state_key] = int(flow["agg_trade_id"].max())
+        else:
+            new_quantity_alerts = find_new_quantity_alerts(
+                flow,
+                btc_quantity_alert_threshold,
+                int(last_seen_id),
+            )
+            if enable_btc_quantity_alerts and not new_quantity_alerts.empty:
+                for _, alert in new_quantity_alerts.tail(5).iterrows():
+                    side_label = "COMPRA" if alert["side"] == "buy" else "VENTA"
+                    icon = "🟢" if alert["side"] == "buy" else "🔴"
+                    st.toast(
+                        f"{icon} {side_label} GRANDE: {alert['quantity']:.3f} BTC "
+                        f"a ${alert['price']:,.2f} "
+                        f"(${alert['quote_value']:,.0f})",
+                        icon="🚨",
+                    )
+                latest_alert = new_quantity_alerts.iloc[-1]
+                st.session_state.last_quantity_alert = {
+                    "side": latest_alert["side"],
+                    "quantity": float(latest_alert["quantity"]),
+                    "price": float(latest_alert["price"]),
+                    "quote_value": float(latest_alert["quote_value"]),
+                    "timestamp": latest_alert["timestamp"],
+                }
+            st.session_state[alert_state_key] = int(flow["agg_trade_id"].max())
+
+        latest_quantity_alert = st.session_state.get("last_quantity_alert")
+        if latest_quantity_alert:
+            alert_age = max(
+                0.0,
+                float((now - latest_quantity_alert["timestamp"]).total_seconds()),
+            )
+            if alert_age <= 300:
+                alert_message = (
+                    f"Última alerta: {'COMPRA' if latest_quantity_alert['side'] == 'buy' else 'VENTA'} "
+                    f"de {latest_quantity_alert['quantity']:.3f} BTC a "
+                    f"${latest_quantity_alert['price']:,.2f}, hace {format_duration(alert_age)}."
+                )
+                if latest_quantity_alert["side"] == "buy":
+                    st.success(f"🟢 {alert_message}")
+                else:
+                    st.error(f"🔴 {alert_message}")
+
         large, effective_threshold = classify_large_trades(
             flow,
             min_quote_value=large_trade_min_usdt,
@@ -214,7 +276,6 @@ def render_large_trades_monitor():
                 f"${effective_threshold:,.0f} en la muestra disponible."
             )
 
-        now = pd.Timestamp.now(tz="UTC")
         newest_flow_time = flow["timestamp"].max()
         flow_age_seconds = max(0.0, float((now - newest_flow_time).total_seconds()))
         since_buy = seconds_since_last_event(large, "buy", now)
@@ -235,6 +296,96 @@ def render_large_trades_monitor():
         c2.metric("Última venta grande", format_duration(since_sell))
         c3.metric("Umbral efectivo", f"${effective_threshold:,.0f}")
         c4.metric("Desequilibrio 30 min", f"{imbalance:+.1f}%", help="Positivo: dominan compras agresoras; negativo: ventas.")
+
+        st.markdown(
+            f"#### Impacto posterior de compras/ventas ≥ {btc_quantity_alert_threshold:.0f} BTC"
+        )
+        impact_summary, quantity_events = analyze_large_trade_price_impact(
+            flow,
+            btc_quantity_alert_threshold,
+            horizons_minutes=(1, 5, 15, 30),
+        )
+        if impact_summary.empty:
+            st.info(
+                f"No hay suficientes operaciones de al menos "
+                f"{btc_quantity_alert_threshold:.0f} BTC con tiempo posterior observable."
+            )
+        else:
+            impact_display = impact_summary.copy()
+            impact_display["Tipo"] = impact_display["side"].map({
+                "buy": "🟢 Compra",
+                "sell": "🔴 Venta",
+            })
+            impact_display["Horizonte"] = (
+                impact_display["horizon_minutes"].astype(int).astype(str) + " min"
+            )
+            impact_display["Muestras"] = impact_display["samples"]
+            impact_display["Cambio promedio"] = impact_display["mean_change_pct"]
+            impact_display["Cambio mediano"] = impact_display["median_change_pct"]
+            impact_display["Prob. sube"] = impact_display["probability_up"] * 100.0
+            impact_display["Prob. cae"] = impact_display["probability_down"] * 100.0
+            impact_display["Prob. movimiento contrario"] = (
+                impact_display["adverse_probability"] * 100.0
+            )
+            st.dataframe(
+                impact_display[[
+                    "Tipo", "Horizonte", "Muestras", "Cambio promedio",
+                    "Cambio mediano", "Prob. sube", "Prob. cae",
+                    "Prob. movimiento contrario",
+                ]],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Cambio promedio": st.column_config.NumberColumn(format="%+.3f%%"),
+                    "Cambio mediano": st.column_config.NumberColumn(format="%+.3f%%"),
+                    "Prob. sube": st.column_config.NumberColumn(format="%.1f%%"),
+                    "Prob. cae": st.column_config.NumberColumn(format="%.1f%%"),
+                    "Prob. movimiento contrario": st.column_config.NumberColumn(format="%.1f%%"),
+                },
+            )
+            if int(impact_summary["samples"].min()) < 20:
+                st.warning(
+                    "Algunos resultados tienen menos de 20 muestras; deben considerarse preliminares."
+                )
+
+            event_display = quantity_events.sort_values(
+                "timestamp", ascending=False
+            ).head(50).copy()
+            event_display["Hora (Lima)"] = (
+                event_display["timestamp"].dt.tz_convert("America/Lima")
+                .dt.strftime("%Y-%m-%d %H:%M:%S")
+            )
+            event_display["Tipo"] = event_display["side"].map({
+                "buy": "🟢 Compra",
+                "sell": "🔴 Venta",
+            })
+            event_display["BTC"] = event_display["quantity"]
+            event_display["Precio"] = event_display["price"]
+            for minutes in (1, 5, 15, 30):
+                event_display[f"Después {minutes}m"] = event_display[
+                    f"return_{minutes}m_pct"
+                ]
+            with st.expander("Ver cada operación ≥ umbral y su resultado posterior"):
+                st.dataframe(
+                    event_display[[
+                        "Hora (Lima)", "Tipo", "BTC", "Precio",
+                        "Después 1m", "Después 5m", "Después 15m", "Después 30m",
+                    ]],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "BTC": st.column_config.NumberColumn(format="%.4f"),
+                        "Precio": st.column_config.NumberColumn(format="$%.2f"),
+                        "Después 1m": st.column_config.NumberColumn(format="%+.3f%%"),
+                        "Después 5m": st.column_config.NumberColumn(format="%+.3f%%"),
+                        "Después 15m": st.column_config.NumberColumn(format="%+.3f%%"),
+                        "Después 30m": st.column_config.NumberColumn(format="%+.3f%%"),
+                    },
+                )
+        st.caption(
+            "El cambio se mide desde el precio del aggTrade hasta el primer trade disponible "
+            "tras cada horizonte. Las filas recientes permanecen pendientes hasta que transcurra el tiempo."
+        )
 
         st.markdown("#### Volumen comprado y vendido en 24/72 horas")
         volume_summaries = cached_taker_volume_summaries(symbol)

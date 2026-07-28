@@ -422,6 +422,90 @@ def classify_large_trades(
     return large.reset_index(drop=True), threshold
 
 
+def analyze_large_trade_price_impact(
+    trades: pd.DataFrame,
+    min_quantity: float,
+    horizons_minutes: tuple[int, ...] = (1, 5, 15, 30),
+    max_lookup_delay_seconds: float = 30.0,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Mide el cambio posterior a cada aggTrade que supera una cantidad base.
+
+    Busca el primer precio disponible a partir de cada horizonte. Si existe una
+    discontinuidad de datos mayor al margen permitido, deja el resultado vacío
+    para no confundir una brecha de conexión con impacto de mercado.
+    """
+    if min_quantity <= 0:
+        raise ValueError("min_quantity debe ser positivo")
+    required = {"agg_trade_id", "timestamp", "price", "quantity", "side"}
+    missing = required.difference(trades.columns)
+    if missing:
+        raise ValueError(f"Faltan columnas: {sorted(missing)}")
+    if trades.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    ordered = trades.sort_values(["timestamp", "agg_trade_id"]).reset_index(drop=True)
+    events = ordered[ordered["quantity"] >= min_quantity].copy()
+    if events.empty:
+        return pd.DataFrame(), events
+
+    trade_times = ordered["timestamp"].astype("int64").to_numpy()
+    trade_prices = ordered["price"].to_numpy(dtype=float)
+    event_times = events["timestamp"].astype("int64").to_numpy()
+    event_prices = events["price"].to_numpy(dtype=float)
+    tolerance_ns = int(max_lookup_delay_seconds * 1_000_000_000)
+
+    for minutes in horizons_minutes:
+        target_times = event_times + int(minutes * 60 * 1_000_000_000)
+        future_indices = np.searchsorted(trade_times, target_times, side="left")
+        valid = future_indices < len(trade_times)
+        safe_indices = np.minimum(future_indices, len(trade_times) - 1)
+        lookup_delay = trade_times[safe_indices] - target_times
+        valid &= lookup_delay >= 0
+        valid &= lookup_delay <= tolerance_ns
+        returns = np.full(len(events), np.nan)
+        returns[valid] = (
+            trade_prices[safe_indices[valid]] / event_prices[valid] - 1.0
+        ) * 100.0
+        events[f"return_{minutes}m_pct"] = returns
+
+    summaries = []
+    for side in ("buy", "sell"):
+        side_events = events[events["side"] == side]
+        for minutes in horizons_minutes:
+            values = side_events[f"return_{minutes}m_pct"].dropna().to_numpy(dtype=float)
+            if not len(values):
+                continue
+            summaries.append({
+                "side": side,
+                "horizon_minutes": minutes,
+                "samples": len(values),
+                "mean_change_pct": float(np.mean(values)),
+                "median_change_pct": float(np.median(values)),
+                "p25_change_pct": float(np.percentile(values, 25)),
+                "p75_change_pct": float(np.percentile(values, 75)),
+                "probability_up": float((values > 0).mean()),
+                "probability_down": float((values < 0).mean()),
+                "adverse_probability": float(
+                    (values < 0).mean() if side == "buy" else (values > 0).mean()
+                ),
+            })
+    return pd.DataFrame(summaries), events.reset_index(drop=True)
+
+
+def find_new_quantity_alerts(
+    trades: pd.DataFrame,
+    min_quantity: float,
+    last_seen_id: int | None,
+) -> pd.DataFrame:
+    """Retorna solamente eventos nuevos que ameritan una alerta."""
+    if trades.empty:
+        return trades.copy()
+    alerts = trades[trades["quantity"] >= min_quantity].copy()
+    if last_seen_id is not None:
+        alerts = alerts[alerts["agg_trade_id"] > last_seen_id]
+    return alerts.sort_values("agg_trade_id").reset_index(drop=True)
+
+
 def seconds_since_last_event(
     large_trades: pd.DataFrame, side: str, now: pd.Timestamp | None = None
 ) -> float | None:

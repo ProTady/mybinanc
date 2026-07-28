@@ -7,9 +7,11 @@ import numpy as np
 import pandas as pd
 
 from whale_trades import (
+    analyze_large_trade_price_impact,
     classify_large_trades,
     calculate_flow_adjusted_levels,
     calculate_flow_pressure,
+    find_new_quantity_alerts,
     load_aggregate_trades,
     parse_aggregate_trade,
     predict_next_large_buy,
@@ -128,6 +130,36 @@ class AggregateTradeTests(unittest.TestCase):
             self.assertGreater(result["skipped"], 0)
         finally:
             os.remove(path)
+
+    def test_quantity_impact_analysis_and_new_alerts(self):
+        timestamps = pd.date_range(
+            "2026-01-01", periods=41, freq="min", tz="UTC"
+        )
+        prices = np.linspace(100, 140, 41)
+        frame = pd.DataFrame({
+            "agg_trade_id": np.arange(1, 42),
+            "timestamp": timestamps,
+            "price": prices,
+            "quantity": np.ones(41),
+            "quote_value": prices,
+            "side": ["buy"] * 41,
+        })
+        frame.loc[0, ["quantity", "side"]] = [5.0, "buy"]
+        frame.loc[10, ["quantity", "side"]] = [10.0, "sell"]
+
+        summary, events = analyze_large_trade_price_impact(
+            frame, min_quantity=5.0, horizons_minutes=(1, 5, 15, 30)
+        )
+        self.assertEqual(len(events), 2)
+        buy_1m = summary[
+            (summary["side"] == "buy")
+            & (summary["horizon_minutes"] == 1)
+        ].iloc[0]
+        self.assertAlmostEqual(buy_1m["median_change_pct"], 1.0)
+        self.assertEqual(buy_1m["probability_up"], 1.0)
+
+        alerts = find_new_quantity_alerts(frame, 5.0, last_seen_id=5)
+        self.assertEqual(alerts["agg_trade_id"].tolist(), [11])
 
 
 if __name__ == "__main__":

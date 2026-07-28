@@ -8,6 +8,8 @@ Dashboard experimental de trading para Binance Spot con:
 - Validación temporal walk-forward y abstención cuando no hay utilidad estimada.
 - Backtest con comisiones, slippage y gestión de riesgo.
 - Monitor de compras y ventas agresoras grandes.
+- Alertas visuales para operaciones agregadas de 5/10 BTC y análisis de su
+  impacto posterior a 1, 5, 15 y 30 minutos.
 - Volumen taker comprador/vendedor de 24 y 72 horas.
 - Presión de flujo y zonas orientativas de entrada, stop y objetivo.
 - Pronóstico del precio de cierre a 15 min, 30 min, 1 h y 1 día con
