@@ -10,6 +10,8 @@ Dashboard experimental de trading para Binance Spot con:
 - Monitor de compras y ventas agresoras grandes.
 - Volumen taker comprador/vendedor de 24 y 72 horas.
 - Presión de flujo y zonas orientativas de entrada, stop y objetivo.
+- Pronóstico del precio de cierre a 15 min, 30 min, 1 h y 1 día con
+  intervalos cuantiles calibrados y cobertura histórica fuera de muestra.
 
 ## Requisitos
 

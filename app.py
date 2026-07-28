@@ -21,6 +21,7 @@ from model import (
 )
 import config
 from backtest import run_backtest
+from price_forecast import predict_price_ranges, train_price_forecasters
 from whale_trades import (
     classify_large_trades,
     calculate_flow_adjusted_levels,
@@ -107,6 +108,10 @@ trade_direction = st.sidebar.selectbox("Dirección Operativa", options=["both", 
 transaction_fee = st.sidebar.slider("Comisión por Operación (%)", min_value=0.0, max_value=0.5, value=0.1, step=0.01) / 100.0
 slippage = st.sidebar.slider("Slippage estimado por lado (%)", min_value=0.0, max_value=0.2, value=0.02, step=0.01) / 100.0
 target_horizon = st.sidebar.slider("Horizonte máximo de la operación (velas)", min_value=3, max_value=48, value=12, step=1)
+forecast_coverage_target = st.sidebar.slider(
+    "Cobertura objetivo del rango (%)",
+    min_value=80, max_value=95, value=80, step=1,
+) / 100.0
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🐋 Flujo de Operaciones Grandes")
@@ -357,6 +362,12 @@ if run_btn:
             # Inferencia conserva las velas recientes sin futuro conocido; el
             # entrenamiento solo usa filas que ya pueden etiquetarse.
             df_inference = df_with_features.dropna(subset=feature_cols).copy()
+            price_forecasters = train_price_forecasters(
+                df_with_features,
+                feature_cols,
+                timeframe,
+                target_coverage=forecast_coverage_target,
+            )
             df_final = add_target_and_clean(
                 df_with_features,
                 horizon_bars=target_horizon,
@@ -404,6 +415,7 @@ if run_btn:
             st.session_state.feature_cols = feature_cols
             st.session_state.df_final = df_final
             st.session_state.df_inference = df_inference
+            st.session_state.price_forecasters = price_forecasters
             st.session_state.run_done = True
             
             st.success("¡Simulación completada con éxito!")
@@ -424,6 +436,7 @@ if st.session_state.run_done:
     feature_cols = st.session_state.feature_cols
     df_final = st.session_state.df_final
     df_inference = st.session_state.get('df_inference', df_final)
+    price_forecasters = st.session_state.get('price_forecasters', {})
     
     # --- SECCIÓN DE PREDICCIÓN DE COMPRA EN TIEMPO REAL ---
     st.markdown("### 🎯 Predicción y Señal de Compra Sugerida (Modelo + Ballenas)")
@@ -565,6 +578,76 @@ if st.session_state.run_done:
         "Los niveles son zonas limit orientativas; sólo son accionables cuando el modelo habilita una señal. "
         "Este ajuste en tiempo real todavía no forma parte del backtest histórico."
     )
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # --- PRONOSTICO MULTI-HORIZONTE DE PRECIO ---
+    st.subheader("🔭 Rango probable del precio por horizonte")
+    forecast_rows = predict_price_ranges(
+        price_forecasters,
+        latest_features,
+        current_close,
+    )
+    available_forecasts = [row for row in forecast_rows if row["available"]]
+    unavailable_forecasts = [row for row in forecast_rows if not row["available"]]
+
+    if available_forecasts:
+        forecast_table = pd.DataFrame([{
+            "Horizonte": row["horizon"],
+            "Mínimo del rango": row["lower_price"],
+            "Precio central": row["median_price"],
+            "Máximo del rango": row["upper_price"],
+            "Cambio central": row["expected_change_pct"],
+            "Prob. subida": row["probability_up"] * 100.0,
+            "Cobertura real": row["coverage"] * 100.0,
+            "Exactitud dirección": row["direction_accuracy"] * 100.0,
+            "Base ingenua": row["direction_baseline"] * 100.0,
+            "Estado 80%": "✅ Validado" if row["coverage"] >= 0.80 else "❌ No alcanza",
+        } for row in available_forecasts])
+        st.dataframe(
+            forecast_table,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Mínimo del rango": st.column_config.NumberColumn(format="$%.2f"),
+                "Precio central": st.column_config.NumberColumn(format="$%.2f"),
+                "Máximo del rango": st.column_config.NumberColumn(format="$%.2f"),
+                "Cambio central": st.column_config.NumberColumn(format="%+.2f%%"),
+                "Prob. subida": st.column_config.NumberColumn(format="%.1f%%"),
+                "Cobertura real": st.column_config.NumberColumn(format="%.1f%%"),
+                "Exactitud dirección": st.column_config.NumberColumn(format="%.1f%%"),
+                "Base ingenua": st.column_config.NumberColumn(format="%.1f%%"),
+            },
+        )
+        coverages_ok = all(row["coverage"] >= 0.80 for row in available_forecasts)
+        if coverages_ok:
+            st.success(
+                "Los rangos alcanzaron al menos 80% de cobertura en el bloque histórico fuera de muestra."
+            )
+        else:
+            failed = ", ".join(
+                row["horizon"] for row in available_forecasts if row["coverage"] < 0.80
+            )
+            st.warning(
+                f"El rango todavía no alcanza 80% de cobertura fuera de muestra en: {failed}. "
+                "El resultado se muestra sin corregirlo con datos del test."
+            )
+        best_direction = max(row["direction_accuracy"] for row in available_forecasts)
+        if best_direction < 0.80:
+            st.info(
+                f"La mejor exactitud direccional fuera de muestra es {best_direction * 100:.1f}%, "
+                "no 80%. El 80% corresponde a cobertura del rango, no a certeza de subida o bajada."
+            )
+        st.caption(
+            "Mínimo y máximo forman un intervalo para el precio de cierre al terminar cada horizonte; "
+            "no son los extremos intraperiodo. Cobertura y dirección se calculan sobre el 20% cronológico "
+            "más reciente, nunca usado para entrenar ni calibrar."
+        )
+    if unavailable_forecasts:
+        reasons = "; ".join(
+            f"{row['horizon']}: {row['reason']}" for row in unavailable_forecasts
+        )
+        st.warning(f"Pronósticos no disponibles — {reasons}")
 
     st.markdown("<br>", unsafe_allow_html=True)
     
