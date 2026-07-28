@@ -121,7 +121,7 @@ large_trade_lookback = st.sidebar.selectbox(
     "Ventana del flujo", options=[1, 6, 24, 72], index=2,
     format_func=lambda hours: f"Últimas {hours} horas",
 )
-auto_refresh_whales = st.sidebar.toggle("Actualizar flujo cada 15 segundos", value=True)
+auto_refresh_whales = st.sidebar.toggle("Actualizar flujo cada 5 segundos", value=True)
 
 st.sidebar.markdown("---")
 run_btn = st.sidebar.button("🚀 Ejecutar Simulación", use_container_width=True)
@@ -169,7 +169,7 @@ except Exception as e:
 st.markdown("<br>", unsafe_allow_html=True)
 
 
-@st.fragment(run_every=15)
+@st.fragment(run_every=5)
 def render_large_trades_monitor():
     """Monitor aislado: su refresco no vuelve a entrenar el modelo."""
     st.markdown("### 🐋 Compras y ventas grandes en Binance Spot")
@@ -180,10 +180,18 @@ def render_large_trades_monitor():
             sync_result = sync_aggregate_trades(
                 symbol,
                 initial_trades=5_000,
-                max_incremental_pages=3,
+                max_incremental_pages=5,
+                resync_recent_trades=5_000,
             )
             if sync_result["inserted"]:
                 st.caption(f"Se incorporaron {sync_result['inserted']:,} operaciones nuevas.")
+            if sync_result.get("resynced") and sync_result.get("skipped", 0) > 0:
+                st.warning(
+                    f"Se detectó un atraso de {sync_result['gap_before']:,} aggTrades. "
+                    f"Se omitieron {sync_result['skipped']:,} eventos intermedios y se saltó "
+                    "a la ventana más reciente para recuperar el tiempo real. "
+                    "Los totales de 24/72 horas no se ven afectados."
+                )
 
         flow = load_aggregate_trades(symbol, lookback_hours=large_trade_lookback)
         if flow.empty:
@@ -202,6 +210,8 @@ def render_large_trades_monitor():
             )
 
         now = pd.Timestamp.now(tz="UTC")
+        newest_flow_time = flow["timestamp"].max()
+        flow_age_seconds = max(0.0, float((now - newest_flow_time).total_seconds()))
         since_buy = seconds_since_last_event(large, "buy", now)
         since_sell = seconds_since_last_event(large, "sell", now)
         recent_cutoff = now - pd.Timedelta(minutes=30)
@@ -210,7 +220,12 @@ def render_large_trades_monitor():
         sell_usdt = float(last_30m.loc[last_30m["side"] == "sell", "quote_value"].sum())
         imbalance = (buy_usdt - sell_usdt) / max(1.0, buy_usdt + sell_usdt) * 100.0
 
-        c1, c2, c3, c4 = st.columns(4)
+        c0, c1, c2, c3, c4 = st.columns(5)
+        c0.metric(
+            "Estado del flujo",
+            "AL DÍA" if flow_age_seconds <= 30 else "ATRASADO",
+            format_duration(flow_age_seconds),
+        )
         c1.metric("Última compra grande", format_duration(since_buy))
         c2.metric("Última venta grande", format_duration(since_sell))
         c3.metric("Umbral efectivo", f"${effective_threshold:,.0f}")
@@ -311,6 +326,8 @@ def render_large_trades_monitor():
         st.caption(
             f"Muestra almacenada: {len(flow):,} aggTrades desde "
             f"{flow['timestamp'].min().tz_convert('America/Lima'):%Y-%m-%d %H:%M:%S}. "
+            f"Último dato: {newest_flow_time.tz_convert('America/Lima'):%Y-%m-%d %H:%M:%S} "
+            f"(hace {format_duration(flow_age_seconds)}). "
             "El lado indica al agresor (taker), no la identidad del operador."
         )
     except Exception as exc:

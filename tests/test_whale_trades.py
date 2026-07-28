@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -14,6 +15,7 @@ from whale_trades import (
     predict_next_large_buy,
     save_aggregate_trades,
     summarize_taker_volume_klines,
+    sync_aggregate_trades,
 )
 
 
@@ -94,6 +96,38 @@ class AggregateTradeTests(unittest.TestCase):
         self.assertGreater(levels["short"]["entry"], 100)
         self.assertGreater(levels["long"]["target"], levels["long"]["entry"])
         self.assertLess(levels["short"]["target"], levels["short"]["entry"])
+
+    def test_large_backlog_jumps_to_recent_window(self):
+        handle, path = tempfile.mkstemp(suffix=".db")
+        os.close(handle)
+        now_ms = int(pd.Timestamp.now(tz="UTC").timestamp() * 1000)
+
+        def raw_trade(trade_id):
+            return {
+                "a": trade_id, "p": "100", "q": "1", "f": trade_id,
+                "l": trade_id, "T": now_ms + trade_id, "m": False,
+            }
+
+        def fake_fetch(_symbol, limit=1000, from_id=None, timeout=10.0):
+            start = 9001 if from_id is None else from_id
+            end = min(start + limit, 10001)
+            return [raw_trade(trade_id) for trade_id in range(start, end)]
+
+        try:
+            save_aggregate_trades([raw_trade(100)], "BTC/USDT", path)
+            with patch("whale_trades.fetch_aggregate_trades", side_effect=fake_fetch):
+                result = sync_aggregate_trades(
+                    "BTC/USDT",
+                    db_file=path,
+                    max_incremental_pages=2,
+                    resync_recent_trades=2_000,
+                )
+            self.assertTrue(result["resynced"])
+            self.assertEqual(result["latest_id"], 10_000)
+            self.assertEqual(result["remote_latest_id"], 10_000)
+            self.assertGreater(result["skipped"], 0)
+        finally:
+            os.remove(path)
 
 
 if __name__ == "__main__":

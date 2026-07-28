@@ -286,24 +286,73 @@ def sync_aggregate_trades(
     db_file: str = config.DB_FILE,
     initial_trades: int = 10_000,
     max_incremental_pages: int = 5,
+    resync_recent_trades: int = 5_000,
 ) -> dict:
-    """Inicializa un historial reciente y luego continua incrementalmente."""
+    """Sincroniza trades y salta al presente si el atraso supera la capacidad.
+
+    Intentar recuperar cada aggTrade despues de muchas horas desconectado puede
+    dejar al monitor permanentemente atrasado. En ese caso se conserva la base
+    existente, se informa la brecha y se descarga una ventana reciente completa.
+    """
     normalized = normalize_binance_symbol(symbol)
     latest = _latest_stored_id(normalized, db_file)
     inserted = 0
-    requests_made = 0
+    requests_made = 1
+    skipped = 0
+    resynced = False
+
+    # Consultar siempre la punta remota permite saber inmediatamente si la base
+    # local sigue al dia; consultar solo fromId ocultaba atrasos de muchas horas.
+    recent = fetch_aggregate_trades(normalized, limit=1000)
+    if not recent:
+        return {
+            "inserted": 0,
+            "requests": requests_made,
+            "latest_id": latest,
+            "remote_latest_id": None,
+            "gap_before": 0,
+            "skipped": 0,
+            "resynced": False,
+        }
+
+    newest_id = int(recent[-1]["a"])
+    gap_before = max(0, newest_id - latest) if latest is not None else 0
 
     if latest is None:
-        recent = fetch_aggregate_trades(normalized, limit=1000)
-        requests_made += 1
-        if not recent:
-            return {"inserted": 0, "requests": requests_made, "latest_id": None}
-        newest_id = int(recent[-1]["a"])
         first_id = max(0, newest_id - max(1000, initial_trades) + 1)
+        resynced = True
+    elif gap_before <= 0:
+        # Guardar la pagina reciente tambien repara cualquier hueco pequeno.
+        inserted += save_aggregate_trades(recent, normalized, db_file)
+        first_id = None
+    elif gap_before <= 1000:
+        # La pagina reciente contiene todos los IDs nuevos.
+        inserted += save_aggregate_trades(recent, normalized, db_file)
+        first_id = None
+    elif gap_before <= max_incremental_pages * 1000:
+        # Brecha recuperable: no se omite ningun trade.
+        next_id = latest + 1
+        for _ in range(max_incremental_pages):
+            page = fetch_aggregate_trades(normalized, limit=1000, from_id=next_id)
+            requests_made += 1
+            if not page:
+                break
+            inserted += save_aggregate_trades(page, normalized, db_file)
+            page_last = int(page[-1]["a"])
+            if page_last >= newest_id or len(page) < 1000 or page_last < next_id:
+                break
+            next_id = page_last + 1
+        first_id = None
+    else:
+        # Brecha demasiado grande: priorizar datos actuales. Los agregados
+        # completos de 24/72h se calculan aparte con klines y no se ven afectados.
+        first_id = max(0, newest_id - max(1000, resync_recent_trades) + 1)
+        skipped = max(0, first_id - latest - 1)
+        resynced = True
+
+    if first_id is not None:
         max_pages = math.ceil((newest_id - first_id + 1) / 1000)
         page_starts = [first_id + page * 1000 for page in range(max_pages)]
-        # Las paginas son independientes y pequenas; concurrencia limitada
-        # reduce mucho la espera inicial sin acercarse a los limites publicos.
         with ThreadPoolExecutor(max_workers=min(5, max_pages)) as executor:
             pages = list(executor.map(
                 lambda start: fetch_aggregate_trades(normalized, limit=1000, from_id=start),
@@ -314,23 +363,15 @@ def sync_aggregate_trades(
             if not page:
                 continue
             inserted += save_aggregate_trades(page, normalized, db_file)
-    else:
-        next_id = latest + 1
-        for _ in range(max_incremental_pages):
-            page = fetch_aggregate_trades(normalized, limit=1000, from_id=next_id)
-            requests_made += 1
-            if not page:
-                break
-            inserted += save_aggregate_trades(page, normalized, db_file)
-            page_last = int(page[-1]["a"])
-            if len(page) < 1000 or page_last < next_id:
-                break
-            next_id = page_last + 1
 
     return {
         "inserted": inserted,
         "requests": requests_made,
         "latest_id": _latest_stored_id(normalized, db_file),
+        "remote_latest_id": newest_id,
+        "gap_before": gap_before,
+        "skipped": skipped,
+        "resynced": resynced,
     }
 
 
