@@ -21,6 +21,15 @@ from model import (
 )
 import config
 from backtest import run_backtest
+from orderflow_model import (
+    build_orderflow_features,
+    build_orderflow_pattern_stats,
+    load_orderflow_klines,
+    load_top_trades_for_candle,
+    predict_next_orderflow_candle,
+    sync_orderflow_klines,
+    train_orderflow_model,
+)
 from price_forecast import predict_price_ranges, train_price_forecasters
 from whale_trades import (
     classify_large_trades,
@@ -519,6 +528,44 @@ if run_btn:
                 timeframe,
                 target_coverage=forecast_coverage_target,
             )
+            try:
+                sync_orderflow_klines(symbol)
+                orderflow_raw = load_orderflow_klines(symbol)
+                orderflow_featured, orderflow_features = build_orderflow_features(
+                    orderflow_raw
+                )
+                orderflow_bundle = train_orderflow_model(
+                    orderflow_featured, orderflow_features
+                )
+                orderflow_prediction = predict_next_orderflow_candle(
+                    orderflow_bundle, orderflow_featured
+                )
+                orderflow_patterns = build_orderflow_pattern_stats(
+                    orderflow_featured
+                )
+                top_candle_trades = (
+                    load_top_trades_for_candle(
+                        symbol, orderflow_prediction["timestamp"]
+                    )
+                    if orderflow_prediction.get("available")
+                    else pd.DataFrame()
+                )
+                orderflow_result = {
+                    "available": orderflow_prediction.get("available", False),
+                    "prediction": orderflow_prediction,
+                    "patterns": orderflow_patterns,
+                    "top_trades": top_candle_trades,
+                    "importances": orderflow_bundle.get(
+                        "importances", pd.DataFrame()
+                    ),
+                    "training_rows": orderflow_bundle.get("rows", 0),
+                }
+            except Exception as orderflow_error:
+                logging.exception(orderflow_error)
+                orderflow_result = {
+                    "available": False,
+                    "reason": str(orderflow_error),
+                }
             df_final = add_target_and_clean(
                 df_with_features,
                 horizon_bars=target_horizon,
@@ -567,6 +614,7 @@ if run_btn:
             st.session_state.df_final = df_final
             st.session_state.df_inference = df_inference
             st.session_state.price_forecasters = price_forecasters
+            st.session_state.orderflow_result = orderflow_result
             st.session_state.run_done = True
             
             st.success("¡Simulación completada con éxito!")
@@ -588,6 +636,10 @@ if st.session_state.run_done:
     df_final = st.session_state.df_final
     df_inference = st.session_state.get('df_inference', df_final)
     price_forecasters = st.session_state.get('price_forecasters', {})
+    orderflow_result = st.session_state.get(
+        'orderflow_result',
+        {"available": False, "reason": "Ejecuta nuevamente la simulación."},
+    )
     
     # --- SECCIÓN DE PREDICCIÓN DE COMPRA EN TIEMPO REAL ---
     st.markdown("### 🎯 Predicción y Señal de Compra Sugerida (Modelo + Ballenas)")
@@ -799,6 +851,216 @@ if st.session_state.run_done:
             f"{row['horizon']}: {row['reason']}" for row in unavailable_forecasts
         )
         st.warning(f"Pronósticos no disponibles — {reasons}")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # --- MICROESTRUCTURA Y FLUJO AGRUPADO EN VELAS DE 5 MINUTOS ---
+    st.subheader("🧬 Anatomía de la vela de 5 minutos y siguiente vela")
+    st.caption(
+        "Agrupa todas las ejecuciones de Binance dentro de cada vela: una compra "
+        "taker consume órdenes de venta y una venta taker consume órdenes de compra. "
+        "Esto mide presión agresora observable; no demuestra que una operación aislada "
+        "haya causado el movimiento."
+    )
+
+    if orderflow_result.get("available"):
+        orderflow_prediction = orderflow_result["prediction"]
+        orderflow_metrics = orderflow_prediction["metrics"]
+        probability_up = orderflow_prediction["probability_up"]
+        probability_down = orderflow_prediction["probability_down"]
+        prediction_margin = abs(probability_up - 0.5)
+        enough_edge = (
+            orderflow_metrics["balanced_accuracy"]
+            > orderflow_metrics["baseline_accuracy"]
+            and prediction_margin >= 0.05
+        )
+        if enough_edge:
+            next_signal = (
+                "🟢 POSITIVA"
+                if orderflow_prediction["prediction"] == "positive"
+                else "🔴 NEGATIVA"
+            )
+        else:
+            next_signal = "🟡 ESPERAR (ventaja débil)"
+
+        candle_is_positive = (
+            orderflow_prediction["candle_direction"] == "positive"
+        )
+        candle_label = "🟢 Positiva" if candle_is_positive else "🔴 Negativa"
+        latest_lima = orderflow_prediction["timestamp"].tz_convert(
+            "America/Lima"
+        )
+
+        flow_col1, flow_col2, flow_col3, flow_col4 = st.columns(4)
+        flow_col1.metric(
+            "Vela analizada",
+            candle_label,
+            latest_lima.strftime("%Y-%m-%d %H:%M Lima"),
+        )
+        flow_col2.metric(
+            "Compras agresoras",
+            f"{orderflow_prediction['buy_base']:,.3f} BTC",
+            f"{orderflow_prediction['buy_ratio'] * 100:.1f}% del volumen",
+        )
+        flow_col3.metric(
+            "Ventas agresoras",
+            f"{orderflow_prediction['sell_base']:,.3f} BTC",
+            f"Delta {orderflow_prediction['delta_base']:+,.3f} BTC",
+        )
+        flow_col4.metric(
+            "Predicción próxima vela",
+            next_signal,
+            f"Sube {probability_up * 100:.1f}% · Baja {probability_down * 100:.1f}%",
+        )
+
+        st.info(
+            f"**Lectura de la vela:** {orderflow_prediction['explanation']} "
+            f"Se registraron {orderflow_prediction['trade_count']:,} ejecuciones "
+            f"y el régimen fue **{orderflow_prediction['flow_regime']}**."
+        )
+
+        quality_col1, quality_col2, quality_col3, quality_col4 = st.columns(4)
+        quality_col1.metric(
+            "Exactitud fuera de muestra",
+            f"{orderflow_metrics['accuracy'] * 100:.1f}%",
+        )
+        quality_col2.metric(
+            "Exactitud balanceada",
+            f"{orderflow_metrics['balanced_accuracy'] * 100:.1f}%",
+        )
+        quality_col3.metric("ROC AUC", f"{orderflow_metrics['roc_auc']:.3f}")
+        quality_col4.metric(
+            "Base ingenua",
+            f"{orderflow_metrics['baseline_accuracy'] * 100:.1f}%",
+            f"{orderflow_metrics['test_rows']:,} velas de prueba",
+        )
+        if orderflow_metrics["accuracy"] < 0.55:
+            st.warning(
+                "La ventaja histórica es pequeña. La señal de 5 minutos funciona "
+                "como contexto y filtro de entrada, no como orden automática ni "
+                "como garantía de dirección."
+            )
+
+        patterns = orderflow_result.get("patterns", pd.DataFrame()).copy()
+        if not patterns.empty:
+            patterns["Vela actual"] = patterns["candle_direction"].map({
+                "positive": "Positiva",
+                "negative": "Negativa",
+                "doji": "Doji",
+            })
+            patterns["Régimen del flujo"] = patterns["flow_regime"].astype(str)
+            patterns["Muestras"] = patterns["candles"]
+            patterns["Próxima positiva"] = (
+                patterns["next_positive_rate"] * 100.0
+            )
+            patterns["Retorno próximo"] = (
+                patterns["next_mean_return"] * 100.0
+            )
+            patterns["Desequilibrio medio"] = (
+                patterns["mean_imbalance"] * 100.0
+            )
+            patterns["Volumen medio BTC"] = patterns["mean_volume"]
+            st.markdown("#### Qué ocurrió después de cada agrupamiento histórico")
+            st.dataframe(
+                patterns[[
+                    "Vela actual", "Régimen del flujo", "Muestras",
+                    "Próxima positiva", "Retorno próximo",
+                    "Desequilibrio medio", "Volumen medio BTC",
+                ]],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Próxima positiva": st.column_config.NumberColumn(
+                        format="%.1f%%"
+                    ),
+                    "Retorno próximo": st.column_config.NumberColumn(
+                        format="%+.4f%%"
+                    ),
+                    "Desequilibrio medio": st.column_config.NumberColumn(
+                        format="%+.1f%%"
+                    ),
+                    "Volumen medio BTC": st.column_config.NumberColumn(
+                        format="%.3f"
+                    ),
+                },
+            )
+
+        detail_col1, detail_col2 = st.columns(2)
+        with detail_col1:
+            st.markdown("#### Operaciones individuales de mayor valor")
+            top_candle_trades = orderflow_result.get(
+                "top_trades", pd.DataFrame()
+            ).copy()
+            if top_candle_trades.empty:
+                st.caption(
+                    "No hay ejecuciones individuales conservadas para esta vela. "
+                    "El agregado completo de Binance sí está incluido arriba."
+                )
+            else:
+                top_candle_trades["Hora Lima"] = (
+                    top_candle_trades["timestamp"]
+                    .dt.tz_convert("America/Lima")
+                    .dt.strftime("%H:%M:%S")
+                )
+                top_candle_trades["Tipo"] = top_candle_trades["side"].map({
+                    "buy": "Compra",
+                    "sell": "Venta",
+                })
+                st.dataframe(
+                    top_candle_trades[[
+                        "Hora Lima", "Tipo", "price", "quantity", "quote_value"
+                    ]],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "price": st.column_config.NumberColumn(
+                            "Precio", format="$%.2f"
+                        ),
+                        "quantity": st.column_config.NumberColumn(
+                            "Cantidad BTC", format="%.6f"
+                        ),
+                        "quote_value": st.column_config.NumberColumn(
+                            "Valor USDT", format="$%.2f"
+                        ),
+                    },
+                )
+
+        with detail_col2:
+            st.markdown("#### Variables que más utilizó el modelo")
+            orderflow_importances = orderflow_result.get(
+                "importances", pd.DataFrame()
+            )
+            if not orderflow_importances.empty:
+                st.dataframe(
+                    orderflow_importances.head(10).rename(columns={
+                        "feature": "Variable",
+                        "importance": "Importancia",
+                    }),
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Importancia": st.column_config.ProgressColumn(
+                            min_value=0.0,
+                            max_value=float(
+                                orderflow_importances["importance"].max()
+                            ),
+                            format="%.4f",
+                        )
+                    },
+                )
+        st.caption(
+            f"Modelo XGBoost entrenado con "
+            f"{orderflow_result.get('training_rows', 0):,} velas completas. "
+            "La prueba es cronológica: el 20% más reciente nunca se usó para "
+            "entrenar ni para elegir el umbral."
+        )
+    else:
+        reason = orderflow_result.get(
+            "reason", orderflow_result.get("prediction", {}).get(
+                "reason", "Sin datos suficientes."
+            )
+        )
+        st.warning(f"Modelo de flujo de 5 minutos no disponible: {reason}")
 
     st.markdown("<br>", unsafe_allow_html=True)
     
